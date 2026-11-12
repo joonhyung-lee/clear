@@ -6,4 +6,4 @@ Joonhyung Lee<sup>1</sup>, Sangbeom Park<sup>2</sup>, Jeongsoo Lim<sup>1</sup>, 
 
 CoRL 2026 Learning Effective Abstractions for Planning (LEAP)
 
-Code, videos, and results: **https://joonhyung-lee.github.io/clear/**
+Code, videos, and results are available at [https://joonhyung-lee.github.io/clear/](https://joonhyung-lee.github.io/clear/).
