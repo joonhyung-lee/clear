@@ -1,0 +1,53 @@
+[
+  {
+    "task": "G1",
+    "controller": "optimized",
+    "scene": "mpc-optimized",
+    "outcome": "1.97 m moved \u00b7 0.07 m goal error \u00b7 14.0 s",
+    "note": "Contact conditioned targets guide the arms along the object reference.",
+    "group": "primary",
+    "body": "g1"
+  },
+  {
+    "task": "Spot + arm",
+    "body": "spot_arm",
+    "controller": "optimized",
+    "scene": "mpc-spot-optimized",
+    "group": "primary",
+    "interactionComplete": true,
+    "outcome": "1.94 m moved \u00b7 0.08 m goal error \u00b7 21.8 s",
+    "note": "Recorded object pushing interval. Subsequent arm stow and navigation are outside this clip. The controller reports completion of the interaction."
+  },
+  {
+    "task": "G1",
+    "body": "g1",
+    "controller": "baseline",
+    "scene": "mpc-g1-native",
+    "group": "primary",
+    "interactionComplete": false,
+    "nativeController": true,
+    "protocolLabel": "",
+    "outcome": "0.59 m moved \u00b7 1.46 m goal error \u00b7 40.0 s",
+    "note": "Shared task geometry and initial base placement. Original CEM, costs, command mapping, policy and actuator settings. Native spline interpolation retained. Full attempt from reset. EEF markers show measured sites, not commanded Cartesian targets. Original native task success condition; otherwise 40 s recording limit."
+  },
+  {
+    "task": "Spot + arm",
+    "body": "spot_arm",
+    "controller": "baseline",
+    "scene": "mpc-spot-native",
+    "group": "primary",
+    "interactionComplete": false,
+    "nativeController": true,
+    "protocolLabel": "",
+    "outcome": "1.60 m moved \u00b7 0.40 m goal error \u00b7 10.5 s",
+    "note": "Shared task geometry and initial base placement. Original CEM, costs, command mapping, policy and actuator settings. Native spline interpolation retained. Shown from reset through five seconds after toppling. EEF markers show measured sites, not commanded Cartesian targets. Display ends five seconds after toppling at 5.50 s.",
+    "displayClip": {
+      "start": 0,
+      "end": 10.499999999999865,
+      "toppleTime": 5.499999999999971,
+      "postToppleSeconds": 5,
+      "criterion": "First recorded base local up vector at or below the world horizontal plane",
+      "zoom": 1.25
+    }
+  }
+]
