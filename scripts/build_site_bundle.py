@@ -1,0 +1,261 @@
+"""Build static page bundles and embedded previews for request-limited hosting.
+
+The manifest preserves script/style order. Run after editing page assets or after
+build_code_browser.py. No network, source maps, or machine paths are embedded.
+"""
+import argparse
+import subprocess
+import base64
+import hashlib
+import gzip
+import io
+import json
+import mimetypes
+from pathlib import Path
+import re
+from urllib.parse import urlsplit
+from bs4 import BeautifulSoup
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST = ROOT / 'scripts/site_bundle_manifest.json'
+
+def data_url(path):
+    data = path.read_bytes()
+    mime = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
+    if path.suffix.lower() in {'.png', '.webp'}:
+        with Image.open(io.BytesIO(data)) as image:
+            image.thumbnail((1600, 1200))
+            output = io.BytesIO()
+            image.save(output, format='WEBP', quality=86, method=6)
+        data, mime = output.getvalue(), 'image/webp'
+    return 'data:' + mime + ';base64,' + base64.b64encode(data).decode()
+
+def versioned(path, parent):
+    import os
+    return os.path.relpath(path, parent) + '?v=' + hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+
+def prepare_main_layout(soup):
+    brand = soup.select_one('#research-nav .research-logo')
+    title = soup.select_one('h1')
+    if brand and title:
+        full_name = title.get_text(' ', strip=True)
+        brand.clear()
+        short = soup.new_tag('strong'); short.string = 'CLEAR:'
+        long = soup.new_tag('span', attrs={'class': 'research-full-name'})
+        long.string = full_name.removeprefix('CLEAR:').strip()
+        brand.append(short); brand.append(' '); brand.append(long)
+        brand['aria-label'] = full_name + ' - overview'
+    method = soup.select_one('#method')
+    if method and not method.select_one(':scope > .method-chapter-header'):
+        heading = method.select_one(':scope > .section-heading')
+        navigation = method.select_one(':scope > .chapter-links')
+        if heading and navigation:
+            header = soup.new_tag('header', attrs={'class': 'method-chapter-header'})
+            heading.insert_before(header)
+            header.append(heading.extract())
+            header.append(navigation.extract())
+    failures = soup.select_one('#failure-cases')
+    if failures:
+        removed_ids = {node['id'] for node in failures.select('[id]')}
+        removed_ids.add('failure-cases')
+        for link in soup.select('a[href^="#"]'):
+            if link['href'][1:] in removed_ids:
+                link.decompose()
+        failures.decompose()
+
+def prepare_grounding_previews(soup):
+    """Make the small scene/embodiment panels loop without starting WebGL."""
+    for viewer in soup.select('#embodiment-demo .viewer[data-embodiment]'):
+        body=viewer['data-embodiment']
+        video=viewer.select_one('video[data-inline-loop]')
+        if not video:
+            old=viewer.select_one('img.preview-image')
+            video=soup.new_tag('video',attrs={'class':'preview-video','data-inline-loop':'',
+                'width':'560','height':'440','aria-label':f'{viewer.get("data-title",body)} structure'})
+            old.replace_with(video)
+        viewer['data-display-mode']='structure'
+        video['data-loop-source']=f'assets/media/structure-{body}.mp4'
+        video['data-loop-mode']='structure'
+        video['data-active-preview']=''
+        video['data-preview-src']=f'assets/media/structure-{body}.png'
+        video['poster']=f'assets/media/structure-{body}.png'
+    for button in soup.select('#embodiment-demo [data-embodiment-mode]'):
+        button['aria-pressed']=str(button['data-embodiment-mode']=='structure').lower()
+    explanation=soup.select_one('#embodiment-demo .embodiment-explanation')
+    if explanation:explanation.string='Link and joint structure across robot embodiments.'
+    for video in soup.select('#input-objects video, #input-scene .media-tile video, #embodiment-demo video[data-inline-loop], .affordance-viewer video'):
+        video['data-inline-loop']=''
+        for key in ('muted','loop','playsinline'):video[key]=''
+        video['preload']='none'
+        source=video.select_one('source')
+        if source:
+            video['data-loop-source']=video.get('data-loop-source') or source.get('src') or source.get('data-src')
+            source['data-src']=video['data-loop-source'].split('?')[0]
+            source.attrs.pop('src',None)
+            video['data-loop-source']=source['data-src']
+
+def build(check=False):
+    stale = []
+    def write(path, text):
+        if check:
+            if not path.exists() or path.read_text() != text:
+                stale.append(path.relative_to(ROOT).as_posix())
+        else:
+            path.write_text(text)
+    if not check:
+        from build_design_assets import build as build_design_assets
+        from build_loop_assets import build as build_loop_assets
+        from build_static_code import build as build_static_code
+        from build_fast_data import build as build_fast_data
+        build_design_assets()
+        build_loop_assets()
+        build_static_code()
+        build_fast_data()
+    tracked = set(subprocess.check_output(['git','ls-files','-z'], cwd=ROOT).decode().split('\0'))
+    manifest = json.loads(MANIFEST.read_text())
+    previews = {p.relative_to(ROOT).as_posix(): data_url(p)
+                for p in sorted((ROOT / 'assets/media').rglob('*.png'))
+                if p.relative_to(ROOT).as_posix() in tracked}
+    for p in sorted((ROOT/'assets').glob('*.png')):
+        if p.relative_to(ROOT).as_posix() in tracked: previews[p.relative_to(ROOT).as_posix()] = data_url(p)
+    for name, entry in manifest.items():
+        page = ROOT / name
+        soup = BeautifulSoup(page.read_text(), 'html.parser')
+        if name == 'index.html':
+            prepare_main_layout(soup)
+            prepare_grounding_previews(soup)
+        js = ROOT / entry['js_output']
+        css = ROOT / entry['css_output']
+        page_previews={}
+        # Reuse only previews already in this document. Shipping every experiment
+        # thumbnail delayed ALL click handlers behind several MB of unused images.
+        chunks = ['/* Generated by scripts/build_site_bundle.py. */',
+                  "window.CLEAR_PREVIEWS={};document.querySelectorAll('[data-preview-src]').forEach(e=>{const key=e.dataset.previewSrc.split('?')[0].replace(/^\\.\\.\\//,'');const value=e.tagName==='VIDEO'?e.poster:e.src;if(value.startsWith('data:'))window.CLEAR_PREVIEWS[key]=value;});"]
+        chunks.append('window.CLEAR_PAGE_PREVIEWS_READY=true;')
+        chunks.append('window.CLEAR_PAGE_PREVIEW_PATH='+json.dumps(js.with_name('page-previews.js').relative_to(ROOT).as_posix())+';')
+        for source in entry['scripts']:
+            chunks.append('\n/* ' + source + ' */\n' + (ROOT/source).read_text() + '\n;')
+        chunks.append("window.CLEAR_APP_READY=true;document.dispatchEvent(new Event('clear-app-ready'));")
+        source='\n'.join(chunks)+'\n'
+        # The anonymous host does not consistently compress text responses.
+        # Inflate locally, then execute as a normal inline script so globals keep
+        # their existing scope. Older browsers can load the plain fallback.
+        core=js.with_name('page-core.js')
+        write(core,source)
+        encoded=base64.b64encode(gzip.compress(source.encode(),mtime=0)).decode()
+        fallback=versioned(core,page.parent)
+        packed=f'''/* Generated application bundle; gzip decoded in the browser. */
+(() => {{
+const fallback=new URL({json.dumps(fallback)},document.baseURI).href;
+function plain(){{const s=document.createElement('script');s.src=fallback;document.head.append(s);}}
+if(typeof DecompressionStream!=='function'){{plain();return;}}
+(async()=>{{
+const bytes=Uint8Array.from(atob({json.dumps(encoded)}),c=>c.charCodeAt(0));
+const stream=new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+const script=document.createElement('script');script.textContent=await new Response(stream).text();
+document.head.append(script);script.remove();
+}})().catch(plain);
+}})();
+'''
+        write(js,packed)
+        styles = []
+        for source in entry['styles']:
+            source = ROOT/source
+            def embed(match):
+                url = match[1].strip('\"\' ')
+                if url.startswith(('data:', '#', 'https:', 'http:')): return match[0]
+                target = (source.parent / urlsplit(url).path).resolve()
+                if not target.is_relative_to(ROOT): raise ValueError('CSS asset leaves repository')
+                return 'url("' + data_url(target) + '")'
+            style=re.sub(r'url\(([^)]+)\)', embed, source.read_text())
+            if source.name=='katex.min.css':
+                faces='\n'.join(re.findall(r'@font-face\{[^}]+\}',style))
+                style=re.sub(r'@font-face\{[^}]+\}','',style)
+                write(ROOT/'assets/math-fonts.css',faces+'\n')
+                encoded_faces=base64.b64encode(gzip.compress(faces.encode(),mtime=0)).decode()
+                font_script=f'''/* Generated math fonts; loaded when equations approach the viewport. */
+window.CLEAR_DATA_READY=window.CLEAR_DATA_READY||{{}};
+window.CLEAR_DATA_READY['assets/math-fonts.js']=(async()=>{{
+if(typeof DecompressionStream!=='function'){{
+await new Promise((resolve,reject)=>{{const link=document.createElement('link');link.rel='stylesheet';link.href=new URL('math-fonts.css',document.currentScript.src);link.onload=resolve;link.onerror=reject;document.head.append(link);}});
+}}else{{
+const bytes=Uint8Array.from(atob({json.dumps(encoded_faces)}),c=>c.charCodeAt(0));
+const stream=new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+const style=document.createElement('style');style.textContent=await new Response(stream).text();document.head.append(style);
+}}
+window.CLEAR_MATH_FONTS=true;
+}})();
+'''
+                write(ROOT/'assets/math-fonts.js',font_script)
+            styles.append(style)
+        write(css, '/* Generated by scripts/build_site_bundle.py. */\n' + '\n'.join(styles) + '\n')
+        for tag in list(soup.select('script[src],link[rel="stylesheet"]')):
+            tag.decompose()
+        for tag in soup.select('#clear-media-bootstrap'):
+            tag.decompose()
+        bootstrap=soup.new_tag('script',id='clear-media-bootstrap')
+        bootstrap.string=(ROOT/'assets/media-bootstrap.js').read_text()
+        soup.head.insert(0,bootstrap)
+        link=soup.new_tag('link', rel='stylesheet', href=versioned(css,page.parent));soup.head.append(link)
+        script=soup.new_tag('script', src=versioned(js,page.parent), defer='');soup.head.append(script)
+        if not soup.select_one('link[rel="icon"]'):
+            soup.head.append(soup.new_tag('link',rel='icon',href='data:,'))
+        policy_host=soup.select_one('[data-curriculum-view]')
+        policy_poster=ROOT/'assets/media/learning-g1-update-00000-stairs_up.webp'
+        if policy_host is not None and policy_poster.exists():
+            policy_host.clear()
+            placeholder=soup.new_tag('img',attrs={
+                'data-policy-placeholder':'','src':data_url(policy_poster),
+                'alt':'G1 recorded motion replayed in four directions on stairs',
+                'style':'display:block;width:100%;height:auto;aspect-ratio:928 / 752;margin-top:40px'})
+            policy_host.append(placeholder)
+        for tag in soup.select('img,video'):
+            attribute='poster' if tag.name=='video' else 'src'
+            original=tag.get('data-preview-src') or tag.get(attribute)
+            if original and not original.startswith('data:'):
+                target=(page.parent/urlsplit(original).path).resolve()
+                key=target.relative_to(ROOT).as_posix()
+                if key in previews:
+                    tag['data-preview-src']=original
+                    if tag.get('id')=='teaser':tag[attribute]=previews[key]
+                    else:
+                        page_previews[key]=previews[key]
+                        tag[attribute]=previews[key]
+            if tag.name=='video':
+                if tag.get('id')=='teaser':
+                    tag['preload']='auto';tag['autoplay']='';tag['muted']='';tag['loop']=''
+                    teaser=ROOT/'assets/media/teaser-stream.mp4'
+                    if teaser.exists():tag.select_one('source')['src']=versioned(teaser,page.parent)
+                else:
+                    tag['preload']='none';tag.attrs.pop('autoplay',None)
+                    if not tag.find_parent(class_='media-tile') and not tag.find_parent(class_='ego-inset'):
+                        tag['controls']=''
+        preview_path=js.with_name('page-previews.js')
+        preview_core=js.with_name('page-previews-core.js')
+        write(preview_core,'Object.assign(window.CLEAR_PREVIEWS,'+json.dumps(page_previews,separators=(',',':'))+');window.CLEAR_PAGE_PREVIEWS_READY=true;\n')
+        compressed=base64.b64encode(gzip.compress(json.dumps(page_previews,separators=(',',':')).encode(),mtime=0)).decode()
+        key=preview_path.relative_to(ROOT).as_posix()
+        preview_script=f'''/* Generated document previews; never blocks initial controls. */
+window.CLEAR_DATA_READY=window.CLEAR_DATA_READY||{{}};
+window.CLEAR_DATA_READY[{json.dumps(key)}]=(async()=>{{
+if(typeof DecompressionStream!=='function'){{
+await new Promise((resolve,reject)=>{{const s=document.createElement('script');s.src=new URL('page-previews-core.js',document.currentScript.src);s.onload=resolve;s.onerror=reject;document.head.append(s);}});
+}}else{{
+const bytes=Uint8Array.from(atob({json.dumps(compressed)}),c=>c.charCodeAt(0));
+const stream=new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+Object.assign(window.CLEAR_PREVIEWS,JSON.parse(await new Response(stream).text()));
+window.CLEAR_PAGE_PREVIEWS_READY=true;
+}}
+}})();
+'''
+        write(preview_path,preview_script)
+        write(page, str(soup).rstrip()+'\n')
+        print(f'Checked {name}' if check else f'Built {name}: HTML + one stylesheet + one script')
+    if stale:
+        raise SystemExit('Stale generated files: '+', '.join(stale))
+
+if __name__ == '__main__':
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check',action='store_true')
+    build(check=parser.parse_args().check)
